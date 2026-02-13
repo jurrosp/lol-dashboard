@@ -1,11 +1,10 @@
 import streamlit as st
-
+import pandas as pd
 from app.config import players
 from app.riot import get_puuid, get_ranked_match_ids, get_match
 from app.features import extract_features
 from app.analytics import build_dataframe, champion_table
-from app.ml import train_win_model
-
+from app.ml import train_win_model, predict_win_proba
 
 st.set_page_config(page_title="LoL Dashboard", layout="wide")
 st.title("League of Legends – Multi-player Dashboard (Ranked Solo/Duo)")
@@ -92,14 +91,18 @@ st.dataframe(
 
 
 # ---- ML Section (op df_all = zoveel mogelijk) ----
-st.subheader("AI Performance Model (trained on all fetched ranked games)")
+st.subheader("AI Performance Model (Champion-aware)")
 
 st.caption(f"Training set size: {len(df_all)} games (fetched). UI is showing last {len(df)} games.")
 
-ml_result = train_win_model(df_all)
+# Champion selector voor ML
+champ_list = ["All"] + sorted(df_all["champion"].dropna().unique().tolist())
+selected_champ = st.selectbox("Train model for champion", champ_list, index=0)
+
+ml_result = train_win_model(df_all, champion=selected_champ)
 
 if ml_result is None:
-    st.info("Te weinig games voor ML-analyse. Haal meer ranked games op (of speel meer ranked).")
+    st.info("Te weinig games of te weinig win/loss variatie voor dit (champion) model.")
 else:
     st.metric("Model AUC", f"{ml_result['auc']:.2f}")
 
@@ -108,19 +111,47 @@ else:
 
     weights = ml_result["weights"]
 
-    st.subheader("Coaching Insights (simple rules based on weights)")
+    st.subheader("Coaching Insights (per champion)")
 
     if "deaths_per_10" in weights.index and weights["deaths_per_10"] < 0:
-        st.write("🔻 **Deaths/10** is negatief: minder onnodige deaths (zeker early) lijkt je winrate te helpen.")
+        st.write("🔻 **Deaths/10** is negatief: minder deaths (zeker early) lijkt je winrate te helpen.")
 
     if "gpm" in weights.index and weights["gpm"] > 0:
-        st.write("💰 **GPM** is positief: tempo/farm + goede resets lijken sterk bij te dragen aan wins.")
+        st.write("💰 **GPM** is positief: tempo/farm + goede resets lijken belangrijk voor wins.")
 
     if "kp" in weights.index and weights["kp"] > 0:
-        st.write("🤝 **Kill Participation** is positief: meebewegen met fights/objectives loont.")
+        st.write("🤝 **KP** is positief: meebewegen met fights/objectives loont.")
 
     if "vision_score" in weights.index and weights["vision_score"] > 0:
-        st.write("👁 **Vision** is positief: wards/clears blijven waardevol (zeker als jungler).")
+        st.write("👁 **Vision** is positief: vision blijft waardevol (zeker jungle).")
 
+st.subheader("Predicted win probability per game")
 
-st.caption("Data is cached (15 min). Voeg spelers toe in app/config.py → players().")
+ml_res, df_pred = predict_win_proba(df_all, champion=selected_champ)
+
+if df_pred is None:
+    st.info("Kan geen win probability plot maken (te weinig data/variatie).")
+else:
+    # Gebruik dezelfde last_n view voor de plot (recent)
+    dfp = (
+        df_pred.sort_values("game_creation", ascending=False)
+        .head(last_n)
+        .sort_values("game_creation")
+    )
+
+    # Line chart van predicted proba
+    st.line_chart(dfp.set_index("game_creation")["pred_win_proba"])
+
+    # Overzicht tabel (laatste N)
+    view_cols = ["champion", "win", "pred_win_proba", "kills", "deaths", "assists", "kp", "dpm", "gpm"]
+    st.dataframe(
+        dfp.sort_values("game_creation", ascending=False)[view_cols],
+        use_container_width=True,
+    )
+
+    # Quick calibration: gemiddelde predicted proba voor wins vs losses
+    win_mean = df_pred[df_pred["win"] == 1]["pred_win_proba"].mean()
+    loss_mean = df_pred[df_pred["win"] == 0]["pred_win_proba"].mean()
+    cA, cB = st.columns(2)
+    cA.metric("Avg predicted proba (wins)", f"{win_mean:.2f}" if pd.notna(win_mean) else "n/a")
+    cB.metric("Avg predicted proba (losses)", f"{loss_mean:.2f}" if pd.notna(loss_mean) else "n/a")
